@@ -23,7 +23,7 @@ and 3 of its "Suggested phasing"; phase 1 shipped and was hardware verified).
 
 - MSRV: the sibling crates declare `rust-version = "1.80"`. Do not use
   `Option::is_none_or` (1.82) or any API newer than 1.80. Use `map_or`.
-- Every new `i18n` key must exist in all ten language functions in
+- Every new `i18n` key must exist in all nine language functions in
   `src/i18n.rs`: `t_pt`, `t_en`, `t_es`, `t_zh`, `t_ja`, `t_ru`, `t_de`,
   `t_it`, `t_tr`. A missing key falls through to `_ => key`, which renders the
   raw key string to the user.
@@ -38,7 +38,9 @@ and 3 of its "Suggested phasing"; phase 1 shipped and was hardware verified).
   to a `fan.rs` function turns that function into dead code; if that happens,
   say so in the task report rather than deleting a hardware function.
 - Run `cargo test` from `predator-sense-gui/`. The suite is at 260 passing
-  tests before this plan; it must never go down.
+  tests before this plan. Task 1 takes it to 273; Task 3 deletes the two
+  tests of the helper it makes obsolete, landing at 271. It must not drop
+  below that for any other reason.
 
 ---
 
@@ -410,7 +412,7 @@ Two rules the implementer must follow:
 //! unit tested; what is left here is Cairo and gestures, which are not.
 
 use gtk4::prelude::*;
-use gtk4::{self as gtk, cairo, pango};
+use gtk4::{self as gtk, cairo};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -420,7 +422,7 @@ use crate::ui::fan_curve_geometry as geo;
 struct State {
     steps: [u8; geo::STEP_COUNT],
     temp_c: Option<f64>,
-    on_change: Option<Box<dyn Fn([u8; geo::STEP_COUNT])>>,
+    on_change: Option<Rc<dyn Fn([u8; geo::STEP_COUNT])>>,
 }
 
 pub struct FanCurveView {
@@ -473,10 +475,12 @@ pub fn build(steps: [u8; geo::STEP_COUNT]) -> FanCurveView {
                 return;
             }
             widget.queue_draw();
-            // Borrow released before the callback: it calls back into the
-            // page, which calls `set_steps` on this same view.
-            let callback = state.borrow();
-            if let Some(f) = callback.on_change.as_ref() {
+            // The callback is cloned out and the borrow ends before it runs:
+            // it reaches back into the page, which touches this same
+            // RefCell. Holding the borrow across it would panic as soon as
+            // the page pushed anything back.
+            let callback = state.borrow().on_change.clone();
+            if let Some(f) = callback {
                 f(steps);
             }
         })
@@ -506,7 +510,7 @@ pub fn build(steps: [u8; geo::STEP_COUNT]) -> FanCurveView {
 impl FanCurveView {
     /// The callback a gesture fires. Never fired by `set_steps`.
     pub fn set_on_change(&self, f: impl Fn([u8; geo::STEP_COUNT]) + 'static) {
-        self.state.borrow_mut().on_change = Some(Box::new(f));
+        self.state.borrow_mut().on_change = Some(Rc::new(f));
     }
 
     pub fn set_steps(&self, steps: [u8; geo::STEP_COUNT]) {
@@ -637,13 +641,8 @@ fn draw(
         let _ = cr.stroke();
         label(cr, (x + 4.0).min(plot.x + plot.w - 30.0), plot.y + plot.h - 4.0, &format!("{}C", t as i32), 9.0);
     }
-
-    let _ = pango::Weight::Normal; // keep the import honest if unused elsewhere
 }
 ```
-
-If the trailing `pango` line is the only use of that import, delete both the
-line and the import instead of keeping it.
 
 Register it in `predator-sense-gui/src/ui/mod.rs`, after
 `fan_curve_geometry`:
@@ -1347,13 +1346,22 @@ animation timer replace the `match active_anim.borrow().as_str()` block with
 - [ ] **Step 4: Verify it builds and the suite still passes**
 
 Run: `cd predator-sense-gui && cargo build --release 2>&1 | grep -E '^(warning|error)' ; cargo test`
-Expected: no warnings, no errors, 273 passed.
+Expected: no warnings, no errors, 271 passed (273 from Task 1, less the two `plan_with_steps` tests this task deletes).
 
-If a `fan.rs` function has lost its last caller (`get_fan_mode` is the
-likely one: the page was its only user), do not delete it. Report it in the
-task report and leave it; it is a hardware read other code and the AI
-assistant may still want, and deleting a hardware function is a decision for
-the human partner.
+Two dead-code cases this task creates, handled differently:
+
+- `fan::plan_with_steps` (`fan.rs:454`) existed only to carry an edit from
+  `fan_curve_points` into the active mode's plan, which is what
+  `apply_steps_to_active_plan` did and what the new page does directly by
+  writing `FanPlan::Curve`. Delete the function and its two tests,
+  `editing_the_steps_updates_a_curve_plan` and
+  `editing_the_steps_leaves_a_non_curve_plan_alone`. It is a pure helper made
+  obsolete by this task, not a hardware path.
+- `fan::get_fan_mode` loses its last caller: this page was its only user. Do
+  NOT delete it. It reads real EC state that other code and the AI assistant
+  may still want, and deleting a hardware function is the human partner's
+  decision. If it produces a `dead_code` warning, say so in the task report
+  with the exact warning text and leave the function alone.
 
 - [ ] **Step 5: Commit**
 
@@ -1376,7 +1384,7 @@ plan. Curve and Fixed appear only where per-fan PWM does."
 
 ---
 
-### Task 4: The other eight languages
+### Task 4: The other seven languages
 
 **Files:**
 - Modify: `predator-sense-gui/src/i18n.rs` (`t_es`, `t_zh`, `t_ja`, `t_ru`,
@@ -1426,13 +1434,13 @@ done
 Expected: every line reads `9`.
 
 Then: `cargo build --release 2>&1 | grep -E '^(warning|error)'` and
-`cargo test`. Expected: nothing from the first, 273 passed from the second.
+`cargo test`. Expected: nothing from the first, 271 passed from the second.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add predator-sense-gui/src/i18n.rs
-git commit -m "Translate the new fan plan strings into the other eight languages
+git commit -m "Translate the new fan plan strings into the other seven languages
 
 A missing key renders as the key itself, so a page that only had English
 strings would have shown fan_plan_curve_desc to everyone else."
@@ -1448,7 +1456,7 @@ strings would have shown fan_plan_curve_desc to everyone else."
   (`plan_target`, `needs_write`, `write_for`, `may_attempt_write`) are already
   tested individually.
 - Removing the "Keep fan on Auto in Performance/Turbo" switch from Settings.
-  It is issue #41's feature, its description in all ten languages already
+  It is issue #41's feature, its description in all nine languages already
   says it rebinds exactly those two modes, and the Fan Control page's own 3s
   refresh shows its effect. Redundant with the new selector, but removing a
   maintainer-shipped setting is the maintainer's call.
