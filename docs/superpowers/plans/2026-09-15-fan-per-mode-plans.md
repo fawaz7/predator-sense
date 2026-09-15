@@ -806,6 +806,190 @@ the curve took them back four seconds later."
 
 ---
 
+### Task 8: Apply plans on hardware without per-fan PWM
+
+Added mid-execution by controller ruling. The spec requires the reconciler to
+translate `Automatic` and `Max` to the EC preset path on models without PWM
+(`docs/superpowers/specs/2026-09-15-fan-control-design.md`, "The reconciler"),
+and no task implemented it. Task 7 removed the last direct `set_fan_mode`
+callers, so on EC-only hardware fan intent now reaches config and stops there:
+the tick that would apply it is gated behind `caps.fan_pwm` at
+`src/ui/window.rs:598`. Most Acer models this app supports are EC-only.
+
+**Files:**
+- Modify: `src/hardware/fan.rs` (the new function and its tests)
+- Modify: `src/ui/window.rs` (remove the capability gate, dispatch on the result)
+
+**Interfaces:**
+- Consumes: `CurveAction`, `FanMode`, `capabilities::get().fan_pwm`
+- Produces: `fan::FanWrite` and `fan::write_for(target: CurveAction, pwm_available: bool) -> Option<FanWrite>`
+
+- [ ] **Step 1: Write the failing test**
+
+Add inside `mod tests` in `src/hardware/fan.rs`:
+
+```rust
+    #[test]
+    fn pwm_hardware_gets_pwm_writes() {
+        assert_eq!(write_for(CurveAction::Firmware, true), Some(FanWrite::PwmAuto));
+        assert_eq!(
+            write_for(CurveAction::Manual(35), true),
+            Some(FanWrite::PwmPercent(35))
+        );
+    }
+
+    #[test]
+    fn ec_only_hardware_gets_preset_writes() {
+        // plan_for_hardware narrows Curve and Fixed to Automatic when there is
+        // no PWM, so only Automatic and Max can reach here, which is why
+        // Manual maps to the Max preset rather than a duty cycle.
+        assert_eq!(write_for(CurveAction::Firmware, false), Some(FanWrite::PresetAuto));
+        assert_eq!(write_for(CurveAction::Manual(100), false), Some(FanWrite::PresetMax));
+    }
+
+    #[test]
+    fn hold_writes_nothing_on_either_kind_of_hardware() {
+        assert_eq!(write_for(CurveAction::Hold, true), None);
+        assert_eq!(write_for(CurveAction::Hold, false), None);
+    }
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test write_for`
+Expected: FAIL to compile, `cannot find function write_for` / `cannot find type FanWrite`
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `src/hardware/fan.rs`, after `plan_for_hardware`:
+
+```rust
+/// Which hardware call a resolved target needs on this machine.
+///
+/// Two families of Acer hardware reach this point. Models with
+/// `ACER_CAP_PWM` take a duty cycle per fan; everything else has only the EC's
+/// own Auto and Max presets. Keeping the choice in one pure function means the
+/// reconciler does not grow a second decision path, and it stays testable
+/// without hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanWrite {
+    /// `pwm_enable = 2` on both fans: hand them to the firmware curve.
+    PwmAuto,
+    /// A manual duty on both fans.
+    PwmPercent(u8),
+    /// The EC's Auto preset, for models with no per-fan PWM.
+    PresetAuto,
+    /// The EC's Max preset.
+    PresetMax,
+}
+
+pub fn write_for(target: CurveAction, pwm_available: bool) -> Option<FanWrite> {
+    match (target, pwm_available) {
+        (CurveAction::Hold, _) => None,
+        (CurveAction::Firmware, true) => Some(FanWrite::PwmAuto),
+        (CurveAction::Manual(percent), true) => Some(FanWrite::PwmPercent(percent)),
+        // Without per-fan PWM, plan_for_hardware has already narrowed every
+        // plan to Automatic or Max, so a manual target can only have come from
+        // Max. There is no EC preset for an arbitrary percentage.
+        (CurveAction::Firmware, false) => Some(FanWrite::PresetAuto),
+        (CurveAction::Manual(_), false) => Some(FanWrite::PresetMax),
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test write_for && cargo test 2>&1 | grep 'test result'`
+Expected: 3 new tests PASS, whole suite green
+
+- [ ] **Step 5: Remove the capability gate and dispatch on FanWrite**
+
+In `src/ui/window.rs`, the fan tick sits inside `if crate::hardware::capabilities::get().fan_pwm {` (around line 598). That gate is what strands EC-only hardware: delete it so the tick always runs, keeping the block's contents at the outer level. Then replace the `match action` arms so the hardware call comes from `write_for`:
+
+```rust
+                let pwm = crate::hardware::capabilities::get().fan_pwm;
+                let Some(write) = crate::hardware::fan::write_for(target, pwm) else {
+                    return glib::ControlFlow::Continue;
+                };
+                applying.set(true);
+                let applying_done = applying.clone();
+                let state = fan_state.clone();
+                let intended = target;
+                background::run(
+                    move || match write {
+                        crate::hardware::fan::FanWrite::PwmAuto => {
+                            crate::hardware::fan::set_pwm_auto()
+                        }
+                        crate::hardware::fan::FanWrite::PwmPercent(percent) => {
+                            crate::hardware::fan::set_pwm_percent(percent, percent)
+                        }
+                        crate::hardware::fan::FanWrite::PresetAuto => {
+                            crate::hardware::fan::set_fan_mode(crate::hardware::fan::FanMode::Auto)
+                        }
+                        crate::hardware::fan::FanWrite::PresetMax => {
+                            crate::hardware::fan::set_fan_mode(crate::hardware::fan::FanMode::Max)
+                        }
+                    },
+                    move |result| {
+                        applying_done.set(false);
+                        match result {
+                            // FanState tracks the target, not the call: a
+                            // preset Auto and a pwm_enable=2 are both "the
+                            // firmware has them" as far as needs_write cares.
+                            Ok(()) => state.set(match intended {
+                                CurveAction::Firmware => FanState::Firmware,
+                                CurveAction::Manual(percent) => FanState::Manual(percent),
+                                CurveAction::Hold => FanState::Unknown,
+                            }),
+                            Err(error) => {
+                                state.set(FanState::Unknown);
+                                crate::hardware::applog::error(&format!(
+                                    "fan: {write:?} not applied: {error}"
+                                ));
+                            }
+                        }
+                    },
+                );
+```
+
+Keep the `needs_write` check ahead of this, unchanged. Keep the migration branch and the `applying` guard unchanged.
+
+- [ ] **Step 6: Build and run every suite**
+
+Run: `cargo build --release && cargo test 2>&1 | grep 'test result' && cargo test --manifest-path installer/Cargo.toml 2>&1 | grep 'test result'`
+Expected: exit 0; 248 GUI (245 plus 3 new); 84 installer.
+
+- [ ] **Step 7: Verify no writer remains outside the reconciler**
+
+Run:
+
+```bash
+grep -rn 'set_pwm_percent\|set_pwm_auto\|set_fan_mode' src/ --include='*.rs' | grep -v '^\S*:[0-9]*: *//' | grep -v '^src/hardware/fan.rs'
+```
+
+Expected: hits in `src/ui/window.rs` only, and `set_fan_mode` among them (it is no longer dead).
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add predator-sense-gui/src/hardware/fan.rs predator-sense-gui/src/ui/window.rs
+git commit -m "Apply fan plans on hardware without per-fan PWM
+
+The reconciler only ran on models with ACER_CAP_PWM, which was harmless
+while other code wrote fans directly. Once those writers became intent
+only, EC-only hardware, which is most of the models this app supports, had
+its fan intent written to config and applied by nobody.
+
+write_for() picks the hardware call from the resolved target and the
+machine's capability: a duty cycle where there is PWM, the EC's Auto and Max
+presets where there is not. plan_for_hardware has already narrowed Curve and
+Fixed to Automatic on those models, so a manual target there can only mean
+Max.
+
+The capability gate around the tick is gone, since the tick now knows what
+to do on both families of hardware."
+```
+
 ## Self-Review
 
 **Spec coverage:** data model (Task 1), reconciler and its inputs (Task 6), plan resolution including the curve rules (Task 2), per-mode lookup and fallback (Task 3), migration from all four starting points (Task 4), capability narrowing (Task 5), converting every other writer (Task 7), failure handling and back-off (already shipped in `d5f1131`, exercised by Task 6 step 4). Phase 1 of the spec's phasing is fully covered. Phases 2 (UI consolidation) and 3 (curve widget) get their own plans.
