@@ -48,7 +48,16 @@ pub fn resumed() -> bool {
     let Some(current) = suspend_offset() else {
         return false;
     };
-    let current_ms = (current * 1000.0).max(0.0) as u64;
+    resumed_at((current * 1000.0).max(0.0) as u64)
+}
+
+/// The decision itself, with the sample passed in.
+///
+/// Split out so the tests do not have to fake a gap by subtracting from
+/// whatever the running machine's offset happens to be: on a machine that has
+/// not suspended since boot that offset is 0, the subtraction saturates there,
+/// and the "a 30 s gap is a suspend" case could never be expressed at all.
+fn resumed_at(current_ms: u64) -> bool {
     let previous_ms = LAST_OFFSET_MS.swap(current_ms, Ordering::Relaxed);
     if previous_ms == u64::MAX {
         return false;
@@ -60,41 +69,58 @@ pub fn resumed() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Every test here drives the same process-wide `LAST_OFFSET_MS`, so they
+    /// have to take turns: cargo runs them in parallel by default, and two
+    /// interleaved baselines would make either one fail for the other's
+    /// reason.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn the_first_call_only_takes_a_baseline() {
+        let _guard = SERIAL.lock().unwrap();
         LAST_OFFSET_MS.store(u64::MAX, Ordering::Relaxed);
-        assert!(!resumed(), "a fresh process has nothing to compare against");
+        assert!(!resumed_at(0), "a fresh process has nothing to compare against");
     }
 
     #[test]
     fn a_steady_clock_is_not_a_resume() {
+        let _guard = SERIAL.lock().unwrap();
         // Two samples in a row with no suspend between them: the gap between
         // the two clocks has not moved, so nothing should fire.
         LAST_OFFSET_MS.store(u64::MAX, Ordering::Relaxed);
-        let _ = resumed();
-        assert!(!resumed());
+        let _ = resumed_at(4_000);
+        assert!(!resumed_at(4_000));
     }
 
     #[test]
     fn a_jump_past_the_threshold_reads_as_a_resume_once() {
-        let Some(now) = suspend_offset() else {
-            return; // no clocks in this environment; nothing to assert
-        };
-        let now_ms = (now * 1000.0).max(0.0) as u64;
-        // Pretend the last sample was taken 30 s of suspend ago.
-        LAST_OFFSET_MS.store(now_ms.saturating_sub(30_000), Ordering::Relaxed);
-        assert!(resumed(), "a 30 s gap is a suspend");
-        assert!(!resumed(), "and it must not fire again on the next poll");
+        let _guard = SERIAL.lock().unwrap();
+        LAST_OFFSET_MS.store(u64::MAX, Ordering::Relaxed);
+        let _ = resumed_at(4_000);
+        assert!(resumed_at(34_000), "a 30 s gap is a suspend");
+        assert!(!resumed_at(34_000), "and it must not fire again on the next poll");
     }
 
     #[test]
     fn a_jump_under_the_threshold_is_ignored() {
-        let Some(now) = suspend_offset() else {
-            return;
-        };
-        let now_ms = (now * 1000.0).max(0.0) as u64;
-        LAST_OFFSET_MS.store(now_ms.saturating_sub(200), Ordering::Relaxed);
-        assert!(!resumed(), "200 ms of drift is scheduling noise, not a suspend");
+        let _guard = SERIAL.lock().unwrap();
+        LAST_OFFSET_MS.store(u64::MAX, Ordering::Relaxed);
+        let _ = resumed_at(4_000);
+        assert!(
+            !resumed_at(4_200),
+            "200 ms of drift is scheduling noise, not a suspend"
+        );
+    }
+
+    /// The live wrapper still has to agree with the core it delegates to: a
+    /// first call on a real machine only takes a baseline, whatever its
+    /// clocks say.
+    #[test]
+    fn the_live_reading_starts_from_a_baseline_too() {
+        let _guard = SERIAL.lock().unwrap();
+        LAST_OFFSET_MS.store(u64::MAX, Ordering::Relaxed);
+        assert!(!resumed());
     }
 }
