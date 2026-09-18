@@ -434,7 +434,12 @@ pub(crate) fn run() -> AppResult {
     // and a Bluetooth one reconnects. Dropping such a device permanently
     // leaves whatever it served dead - the mode key or the PredatorSense key -
     // with the daemon still running and nothing to say it is half deaf.
-    let mut lost: Vec<(PathBuf, bool)> = Vec::new();
+    // `DeviceKind`, not upstream's `bool`. The re-acquire list merged upstream
+    // as `Vec<(PathBuf, bool)>`, where the flag only said "is this the EC mode
+    // key"; this branch needs to tell three kinds apart when it reopens a node,
+    // so the third element of `devices` is a `DeviceKind` and this has to match
+    // it. A rebase brings upstream's declaration back and nothing compiles.
+    let mut lost: Vec<(PathBuf, DeviceKind)> = Vec::new();
     let mut reopen_countdown = REOPEN_EVERY_POLLS;
     while !devices.is_empty() || !lost.is_empty() {
         let mut poll_fds = devices
