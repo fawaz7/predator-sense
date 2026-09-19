@@ -634,7 +634,47 @@ git commit -m "Stop the idle timer re-reading config and DMI four times a second
 
 ---
 
-### Task 5: One exclusive toggle group helper (item 10)
+### Task 5: NOT DONE - deliberately, see below (item 10)
+
+**Decision 2026-09-19: skipped, and the maintainer asked for his preference.**
+
+The plan for this task rested on the review's framing, that `lighting_page.rs`
+"shows a one-line alternative via `ToggleButton::set_group()`". Reading all
+eight sites before writing anything showed that is not equivalent:
+
+- The `lighting_page` site the review points at is a **two-button direction
+  picker**: no CSS state, no side effects. `set_group` is genuinely enough there.
+- The six `magic_rgb_page` sites carry a **`.mode-active` CSS class that has to
+  move between buttons**, a "refuse to leave every button deselected" rule, and
+  per-item side effects (mutating shared state, `queue_draw`, switching a
+  `gtk::Stack`). `set_group` gives radio semantics but does **not** manage the
+  CSS class, so dropping it in would silently lose the visual selected state -
+  the only way the page shows which effect is active.
+
+The duplication is real. The suggested fix is not a drop-in.
+
+Two things were measured rather than assumed. The six `connect_toggled`
+prologues are structurally identical but **not** byte-identical: they differ in
+the button vector's name (`buttons`, `mode_buttons`, `effect_buttons`,
+`color_buttons`) and one site compares `*other != this_btn` where five compare
+`other != b`. And the build loops differ more than they look: containers
+(`Box::append` vs `FlowBox::insert`), key types (enum, `usize`, `String`) and
+initial-selection tests all vary.
+
+**What was offered instead**, ready to implement if he wants it: extract only
+the toggled handler, which is the part where the abstraction is discovered
+rather than invented. That removes about 78 lines across six sites and fixes
+the `*other != this_btn` inconsistency on the way. The build loops stay put,
+because forcing four different container-and-key shapes through one signature
+needs three closure parameters, which is the usual sign the abstraction is
+wrong.
+
+Not done unilaterally because this page has **no test coverage and eye-only
+verification** - `cargo test` cannot protect it, there is no display in tests -
+and it is the lowest-value item of the five, on code the review itself notes
+predates this PR.
+
+### The original plan for this task, kept for reference
 
 The same roughly 15-line block appears six times in `magic_rgb_page.rs` and twice in `lighting_page.rs`, which already demonstrates the one-line `ToggleButton::set_group()` alternative. Pre-existing code, not introduced by PR #69.
 
