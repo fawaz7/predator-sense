@@ -1,8 +1,17 @@
 # GPU power headroom: 88 W observed against a 140 W rating
 
-**Status:** open question, nothing implemented. Found while measuring something
-else (CHANGELOG §30 and the Turbo pinning question); recorded here rather than
-chased, because it is a bigger lead than what it interrupted.
+**Status: closed 2026-09-25, answered with measurements. The premise below is
+wrong.** The GPU is not stuck at 80 W. In Turbo the firmware hands the driver
+115 W cTGP + 25 W Dynamic Boost through the NPCF device, and `nvidia-smi`
+shows the enforced limit at 140 W under load. What holds the GPU at 75 to 96 W
+in a game is its 87 C target temperature, with Turbo's fan curve already at
+90-100%. The 88 W figure below was hashcat MD5 at the GPU's maximum clock, not
+a power ceiling: SHA-512 reached 104 W. The 80 W `Current Power Limit` reported
+below did not reproduce. The body is kept as it was written.
+
+Found while measuring something else (CHANGELOG §30 and the Turbo pinning
+question); recorded here rather than chased, because it is a bigger lead than
+what it interrupted.
 
 **Machine:** Acer Predator Helios 16 PH16-71, i7-13700HX, RTX 4060 Laptop,
 BIOS V1.18, CachyOS kernel 7.2.5-1-cachyos, NVIDIA driver 615.71.09, on AC.
